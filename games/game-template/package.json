@@ -1,0 +1,21 @@
+{
+  "name": "@h5/game-template",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "新游戏的标准起点（模板骨架）",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": {
+    ".": {
+      "types": "./index.ts",
+      "default": "./index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@h5/game-sdk": "workspace:*"
+  }
+}

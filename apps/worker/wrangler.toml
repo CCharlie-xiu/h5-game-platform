@@ -1,0 +1,36 @@
+name = "h5-game-platform-worker"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# ---------------------------------------------------------------------------
+# 环境变量
+# 生产环境变量 / 密钥不在本阶段配置，请通过 dashboard 或 `wrangler secret` 管理。
+# ---------------------------------------------------------------------------
+[vars]
+ENVIRONMENT = "development"
+
+# ---------------------------------------------------------------------------
+# D1 数据库
+# `database_id` 为占位值：本地开发（--local）使用 .wrangler/state 下的 SQLite，
+# 不校验该值；部署到线上前需替换为 `wrangler d1 create h5-game-platform` 返回的真实 id。
+# ---------------------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "h5-game-platform"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "../../database/migrations"
+
+# ---------------------------------------------------------------------------
+# Durable Objects
+# 阶段 1 仅完成绑定与迁移声明，房间逻辑尚未实现（见 src/durable-objects/game-room.ts）。
+# 使用 SQLite 存储后端（new_sqlite_classes），本地开发无需付费计划。
+# ---------------------------------------------------------------------------
+[[durable_objects.bindings]]
+name = "GAME_ROOM"
+class_name = "GameRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GameRoom"]

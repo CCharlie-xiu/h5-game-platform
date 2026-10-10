@@ -1,0 +1,21 @@
+{
+  "name": "@h5/diffusion-master",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "扩散大师 —— 第一个实际游戏（阶段 1 尚未实现）",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": {
+    ".": {
+      "types": "./index.ts",
+      "default": "./index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@h5/game-sdk": "workspace:*"
+  }
+}

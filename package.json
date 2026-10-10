@@ -1,0 +1,37 @@
+{
+  "name": "h5-game-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "可复用的 H5 联机游戏平台（阶段 1：工程初始化）",
+  "packageManager": "pnpm@10.34.6",
+  "engines": {
+    "node": ">=22.12.0",
+    "pnpm": ">=10"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel --if-present dev",
+    "dev:web": "pnpm --filter @h5/web dev",
+    "dev:worker": "pnpm --filter @h5/worker dev",
+    "build": "pnpm -r --if-present build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && pnpm -r --if-present typecheck",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:generate": "pnpm --filter @h5/worker db:generate",
+    "db:migrate:local": "pnpm --filter @h5/worker db:migrate:local",
+    "db:migrate:remote": "pnpm --filter @h5/worker db:migrate:remote"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@h5/game-protocol": "workspace:*",
+    "@h5/game-template": "workspace:*",
+    "@types/node": "22.20.5",
+    "eslint": "9.39.5",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.71.1",
+    "vite": "7.3.7",
+    "vitest": "4.1.11"
+  }
+}

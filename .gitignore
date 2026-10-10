@@ -9,10 +9,17 @@ build/
 out/
 *.tsbuildinfo
 
+# cloudflare local state
+.wrangler/
+worker-configuration.d.ts
+
 # env
 .env
 .env.local
 .env.*.local
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
 
 # logs
 logs/
@@ -37,3 +44,4 @@ coverage/
 .cache/
 .turbo/
 .parcel-cache/
+.vite/
