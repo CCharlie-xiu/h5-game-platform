@@ -15,6 +15,13 @@
       "when": 1791594208067,
       "tag": "0001_ambitious_human_cannonball",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791617661454,
+      "tag": "0002_material_lightspeed",
+      "breakpoints": true
     }
   ]
 }

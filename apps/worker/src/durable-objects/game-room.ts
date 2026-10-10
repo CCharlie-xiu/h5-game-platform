@@ -38,7 +38,7 @@ import {
 import type { PlayerRecord, RoomRecord } from '@h5/game-core';
 
 import { createRoomRepository } from '../db/repository';
-import type { RoomRepository } from '../db/repository';
+import type { RegisterRoomResult, RoomRepository } from '../db/repository';
 import type { Env } from '../env';
 
 /* -------------------------------------------------------------------------- */
@@ -68,6 +68,11 @@ interface SocketAttachment {
 type AuthorizationResult =
   | { readonly ok: true; readonly playerId: string; readonly player: PlayerRecord }
   | { readonly ok: false; readonly error: ProtocolError };
+
+/** 房间实例登记结果。 */
+type RoomRegistrationResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: 'CODE_IN_USE' | 'REGISTRATION_FAILED' };
 
 /* -------------------------------------------------------------------------- */
 /* Durable Object                                                              */
@@ -174,10 +179,20 @@ export class GameRoom implements DurableObject {
       );
     }
 
+    // 先登记 D1 房间实例，成功后才落 DO 状态：
+    // 登记失败时不留下「DO 有房间但 D1 无实例」的不一致状态。
+    const registered = await this.registerRoomInstance(room, snapshot);
+    if (!registered.ok) {
+      return registered.reason === 'CODE_IN_USE'
+        ? Response.json({ error: ErrorCode.RoomExists }, { status: 409 })
+        : Response.json(
+            { error: ErrorCode.InternalError, message: '房间登记失败，请重试' },
+            { status: 503 },
+          );
+    }
+
     await this.persist(room);
     await this.scheduleCleanup();
-
-    this.state.waitUntil(this.safe(() => this.recordRoomCreated(room, snapshot)));
 
     const token = await signToken(authSecret, roomCode, hostPlayerId);
     return Response.json({ roomCode, playerId: hostPlayerId, token, room: snapshot });
@@ -264,14 +279,14 @@ export class GameRoom implements DurableObject {
   async alarm(): Promise<void> {
     const room = await this.requireRoom();
     if (!room) {
-      await this.destroyRoom();
+      await this.destroyRoom('NO_ROOM');
       return;
     }
 
     const decision = evaluateRoomCleanup(room, Date.now());
     if (decision.destroy) {
       console.log(`[GameRoom] 销毁房间 ${room.roomCode}（原因：${decision.reason}）`);
-      await this.destroyRoom();
+      await this.destroyRoom(decision.reason ?? 'UNKNOWN');
       return;
     }
 
@@ -365,6 +380,20 @@ export class GameRoom implements DurableObject {
       now,
     });
 
+    const snapshot = toSnapshot(room);
+
+    // 先登记 D1 房间实例，成功后才落 DO 状态（与 HTTP 创建路径一致）
+    const registered = await this.registerRoomInstance(room, snapshot);
+    if (!registered.ok) {
+      this.sendError(
+        ws,
+        registered.reason === 'CODE_IN_USE'
+          ? protocolError(ErrorCode.RoomExists, '房间码已被其他活动房间占用')
+          : protocolError(ErrorCode.InternalError, '房间登记失败，请重试'),
+      );
+      return;
+    }
+
     await this.persist(room);
     await this.scheduleCleanup();
 
@@ -375,13 +404,10 @@ export class GameRoom implements DurableObject {
       ws,
       createServerMessage(
         'SESSION_GRANTED',
-        { roomCode, playerId: hostPlayerId, token, room: toSnapshot(room) },
+        { roomCode, playerId: hostPlayerId, token, room: snapshot },
         { roomId: roomCode },
       ),
     );
-
-    const snapshot = toSnapshot(room);
-    this.state.waitUntil(this.safe(() => this.recordRoomCreated(room, snapshot)));
   }
 
   private async onJoinRoom(ws: WebSocket, message: JoinRoomMessage): Promise<void> {
@@ -507,14 +533,18 @@ export class GameRoom implements DurableObject {
         attachment.connectionId,
       );
       this.state.waitUntil(
-        this.safe(() => this.repository.recordPlayerJoined(roomCode, playerSnapshot)),
+        this.recordQuietly('玩家加入记录', () =>
+          this.repository.recordPlayerJoined(result.room.instanceId, roomCode, playerSnapshot),
+        ),
       );
     }
 
     const latest = await this.broadcastLatestState();
     if (latest) {
       this.state.waitUntil(
-        this.safe(() => this.repository.recordRoomStatus(toSnapshot(latest))),
+        this.recordQuietly('房间状态回写', () =>
+          this.repository.recordRoomStatus(latest.instanceId, toSnapshot(latest)),
+        ),
       );
     }
     await this.scheduleCleanup();
@@ -552,24 +582,28 @@ export class GameRoom implements DurableObject {
       attachment.connectionId,
     );
     this.state.waitUntil(
-      this.safe(() =>
-        this.repository.recordPlayerLeft(room.roomCode, auth.player.playerId, Date.now()),
+      this.recordQuietly('玩家离开记录', () =>
+        this.repository.recordPlayerLeft(room.instanceId, auth.player.playerId, Date.now()),
       ),
     );
 
     // 房间已无玩家：立即销毁，避免遗留悬空房主身份与「永远无法开局」的空房间
     if (isEmpty(result.room)) {
       this.state.waitUntil(
-        this.safe(() => this.repository.recordRoomStatus(toSnapshot(result.room))),
+        this.recordQuietly('房间状态回写', () =>
+          this.repository.recordRoomStatus(result.room.instanceId, toSnapshot(result.room)),
+        ),
       );
-      await this.destroyRoom();
+      await this.destroyRoom('EMPTY');
       return;
     }
 
     const latest = await this.broadcastLatestState();
     if (latest) {
       this.state.waitUntil(
-        this.safe(() => this.repository.recordRoomStatus(toSnapshot(latest))),
+        this.recordQuietly('房间状态回写', () =>
+          this.repository.recordRoomStatus(latest.instanceId, toSnapshot(latest)),
+        ),
       );
     }
     await this.scheduleCleanup();
@@ -626,21 +660,31 @@ export class GameRoom implements DurableObject {
 
     if (trigger === LifecycleTrigger.Start && nextSessionId) {
       this.state.waitUntil(
-        this.safe(() =>
-          this.repository.recordSessionStarted(room.roomCode, room.gameId, nextSessionId, now),
+        this.recordQuietly('对局开始记录', () =>
+          this.repository.recordSessionStarted(
+            room.instanceId,
+            room.roomCode,
+            room.gameId,
+            nextSessionId,
+            now,
+          ),
         ),
       );
     }
     if (trigger === LifecycleTrigger.End && previousSessionId) {
       this.state.waitUntil(
-        this.safe(() => this.repository.recordSessionEnded(previousSessionId, now)),
+        this.recordQuietly('对局结束记录', () =>
+          this.repository.recordSessionEnded(room.instanceId, previousSessionId, now),
+        ),
       );
     }
 
     const latest = await this.broadcastLatestState();
     if (latest) {
       this.state.waitUntil(
-        this.safe(() => this.repository.recordRoomStatus(toSnapshot(latest))),
+        this.recordQuietly('房间状态回写', () =>
+          this.repository.recordRoomStatus(latest.instanceId, toSnapshot(latest)),
+        ),
       );
     }
     await this.scheduleCleanup();
@@ -692,7 +736,18 @@ export class GameRoom implements DurableObject {
 
   private async readRoom(): Promise<RoomRecord | null> {
     const stored = await this.state.storage.get<RoomRecord>(ROOM_STORAGE_KEY);
-    return stored ?? null;
+    if (!stored) {
+      return null;
+    }
+    // 兼容阶段 2.3 之前持久化的房间（尚无实例标识）：补齐后回写，
+    // 保证 D1 写入始终具备明确的实例归属。
+    // 使用与迁移 0002 相同的回填规则（`legacy:<房间码>`），使已迁移的 D1 行与新值一致。
+    if (typeof stored.instanceId === 'string' && stored.instanceId.length > 0) {
+      return stored;
+    }
+    const upgraded: RoomRecord = { ...stored, instanceId: `legacy:${stored.roomCode}` };
+    await this.state.storage.put(ROOM_STORAGE_KEY, upgraded);
+    return upgraded;
   }
 
   private async requireRoom(): Promise<RoomRecord | null> {
@@ -714,21 +769,62 @@ export class GameRoom implements DurableObject {
     }
   }
 
-  private async safe(operation: () => Promise<void>): Promise<void> {
+  /**
+   * 执行一次「次要」D1 写入。
+   *
+   * 这些记录（玩家加入/离开、对局开始结束、状态回写）都以房间实例为归属键，
+   * 失败不会破坏房间状态，也不会污染其他实例；但仍必须**显式暴露**，
+   * 不允许静默当成成功。
+   */
+  private async recordQuietly(label: string, operation: () => Promise<void>): Promise<void> {
     try {
       await operation();
     } catch (error) {
-      console.error('[GameRoom] D1 写入失败（不影响房间状态）', error);
+      console.error(
+        `[GameRoom] D1 写入失败（${label}；房间码 ${this.cached?.roomCode ?? '未知'}，实例 ${this.cached?.instanceId ?? '未知'}）`,
+        error,
+      );
     }
   }
 
-  /** 写入房间元数据 + 房主参与记录。 */
-  private async recordRoomCreated(room: RoomRecord, snapshot: RoomSnapshot): Promise<void> {
-    await this.repository.recordRoomCreated(snapshot);
+  /**
+   * 登记 D1 房间实例（原子）并写入房主参与记录。
+   *
+   * 语义：
+   * - 主键（instance_id）冲突 → 同一实例重复登记 → 幂等成功
+   * - 部分唯一索引（code where ended_at is null）冲突 → 房间码仍被其他活动实例占用 → `CODE_IN_USE`
+   * - 其他写入异常（例如 D1 不可用）→ `REGISTRATION_FAILED`，由调用方拒绝本次创建
+   */
+  private async registerRoomInstance(
+    room: RoomRecord,
+    snapshot: RoomSnapshot,
+  ): Promise<RoomRegistrationResult> {
+    let registered: RegisterRoomResult;
+    try {
+      registered = await this.repository.recordRoomCreated(room.instanceId, snapshot);
+    } catch (error) {
+      console.error(
+        `[GameRoom] 房间实例登记失败（房间码 ${room.roomCode}，实例 ${room.instanceId}）`,
+        error,
+      );
+      return { ok: false, reason: 'REGISTRATION_FAILED' };
+    }
+
+    if (!registered.ok) {
+      return { ok: false, reason: 'CODE_IN_USE' };
+    }
+
     const host = toPlayerSnapshot(room, room.hostPlayerId);
     if (host) {
-      await this.repository.recordPlayerJoined(room.roomCode, host);
+      try {
+        await this.repository.recordPlayerJoined(room.instanceId, room.roomCode, host);
+      } catch (error) {
+        // 实例已登记成功；房主参与记录是次要记录，失败在此显式暴露（不静默丢弃）
+        console.error(`[GameRoom] 房主参与记录写入失败（实例 ${room.instanceId}）`, error);
+      }
     }
+
+    return { ok: true };
   }
 
   private attachmentOf(ws: WebSocket): SocketAttachment {
@@ -787,11 +883,31 @@ export class GameRoom implements DurableObject {
   }
 
   /**
-   * 销毁房间：关闭全部连接、清空存储与内存缓存。
+   * 销毁房间：标记实例结束、关闭全部连接、清空存储与内存缓存。
    *
-   * 调用方负责在此之前完成必要的 D1 记录写入（D1 写入不依赖 DO 存储）。
+   * 顺序要点：
+   * 1. **先**在 D1 标记该实例结束（释放房间码的活动占用），再清空 DO 存储。
+   *    这样同一房间码被重新分配时，新实例不会与旧实例的活动记录冲突。
+   * 2. 标记失败不会阻止销毁（房间必须可销毁）；此时旧实例行仍为「活动」，
+   *    同码新建会得到 `CODE_IN_USE` 并由 Worker 换码重试 —— 失败方向是安全的。
+   *
+   * 标记按 `instance_id` 过滤，因此旧实例的迟到写入只会命中它自己那一行。
    */
-  private async destroyRoom(): Promise<void> {
+  private async destroyRoom(reason: string): Promise<void> {
+    const instanceId = this.cached?.instanceId ?? null;
+    const roomCode = this.cached?.roomCode ?? '未知';
+
+    if (instanceId) {
+      try {
+        await this.repository.markRoomEnded(instanceId, Date.now());
+      } catch (error) {
+        console.error(
+          `[GameRoom] 房间实例结束标记写入失败（房间码 ${roomCode}，实例 ${instanceId}，原因 ${reason}）`,
+          error,
+        );
+      }
+    }
+
     for (const socket of this.state.getWebSockets()) {
       try {
         socket.close(1000, 'room closed');

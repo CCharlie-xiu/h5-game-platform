@@ -8,6 +8,7 @@ import type {
 
 import { LifecycleTrigger, evaluateReadyPhase, isTerminal, transition } from './lifecycle';
 import type { TransitionContext } from './lifecycle';
+import { generateId } from './identity';
 
 /** 房间容量与昵称约束（与 `@h5/game-protocol` 的 snapshot Schema 保持一致）。 */
 export const ROOM_LIMITS = {
@@ -77,8 +78,12 @@ export interface SessionRecord {
  * 房间记录（服务端权威状态，持久化到 Durable Object storage）。
  *
  * `authSecret` 仅服务端可见，**不得**进入任何下发给客户端的快照。
+ * `instanceId` 是房间实例标识：房间码可复用，但同码的不同生命周期是不同实例，
+ * D1 记录一律按实例归属。
  */
 export interface RoomRecord {
+  /** 房间实例标识（一次房间生命周期内稳定且唯一） */
+  readonly instanceId: string;
   readonly roomId: string;
   readonly roomCode: string;
   readonly gameId: string;
@@ -321,6 +326,8 @@ export function normalizeNickname(nickname: string): string {
 
 /** 创建房间，房主作为 0 号座位玩家直接入座。 */
 export function createRoom(params: {
+  /** 房间实例标识；缺省时自动生成（房间码可复用，实例标识必须唯一） */
+  readonly instanceId?: string;
   readonly roomId: string;
   readonly roomCode: string;
   readonly gameId: string;
@@ -348,6 +355,7 @@ export function createRoom(params: {
   };
 
   return {
+    instanceId: params.instanceId ?? generateId('r_'),
     roomId: params.roomId.slice(0, ROOM_LIMITS.roomIdMaxLength),
     roomCode: params.roomCode.slice(0, ROOM_LIMITS.roomIdMaxLength),
     gameId: params.gameId.trim().slice(0, ROOM_LIMITS.gameIdMaxLength),
