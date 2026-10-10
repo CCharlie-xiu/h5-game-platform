@@ -1,9 +1,9 @@
 {
-  "name": "@h5/game-core",
+  "name": "@h5/game-client",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "游戏生命周期、房间状态机与纯函数状态转换",
+  "description": "房间 WebSocket 客户端：连接、自动重连、权威状态同步",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {
@@ -19,6 +19,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@h5/game-core": "workspace:*",
     "@h5/game-protocol": "workspace:*"
   }
 }

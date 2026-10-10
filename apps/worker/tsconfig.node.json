@@ -4,5 +4,5 @@
     "lib": ["ES2022"],
     "types": ["node"]
   },
-  "include": ["drizzle.config.ts"]
+  "include": ["drizzle.config.ts", "vitest.config.ts"]
 }

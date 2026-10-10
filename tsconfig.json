@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["node"]
   },
-  "include": ["vitest.config.ts", "tests/**/*.ts"]
+  "include": ["vitest.config.ts", "playwright.config.ts", "tests/**/*.ts", "e2e/**/*.ts"]
 }

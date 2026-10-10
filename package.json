@@ -1,9 +1,9 @@
 {
   "name": "h5-game-platform",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "可复用的 H5 联机游戏平台（阶段 1：工程初始化）",
+  "description": "可复用的 H5 联机游戏平台（阶段 2：通用房间系统与游戏生命周期）",
   "packageManager": "pnpm@10.34.6",
   "engines": {
     "node": ">=22.12.0",
@@ -19,14 +19,20 @@
     "lint:fix": "eslint . --fix",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:integration": "pnpm --filter @h5/worker test",
+    "test:e2e": "playwright test",
+    "test:all": "pnpm test && pnpm test:integration && pnpm test:e2e",
     "db:generate": "pnpm --filter @h5/worker db:generate",
     "db:migrate:local": "pnpm --filter @h5/worker db:migrate:local",
     "db:migrate:remote": "pnpm --filter @h5/worker db:migrate:remote"
   },
   "devDependencies": {
     "@eslint/js": "9.39.5",
+    "@h5/game-client": "workspace:*",
+    "@h5/game-core": "workspace:*",
     "@h5/game-protocol": "workspace:*",
     "@h5/game-template": "workspace:*",
+    "@playwright/test": "1.64.0",
     "@types/node": "22.20.5",
     "eslint": "9.39.5",
     "typescript": "5.9.3",

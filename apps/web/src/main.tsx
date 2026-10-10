@@ -1,6 +1,8 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
+import '@h5/game-ui/styles.css';
+
 import { App } from './App';
 import './index.css';
 

@@ -20,6 +20,8 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8787',
         changeOrigin: true,
+        // 房间 WebSocket 走同源路径 /api/rooms/:code/ws，必须开启 ws 转发
+        ws: true,
       },
     },
   },

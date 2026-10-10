@@ -1,0 +1,245 @@
+/* @h5/game-ui —— 通用游戏 UI 样式（阶段 2 以功能验证为主） */
+
+.gui-room {
+  display: grid;
+  gap: 16px;
+}
+
+.gui-room__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.gui-room__code {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.gui-room__code-label {
+  font-size: 12px;
+  color: var(--muted, #8ea0bd);
+}
+
+.gui-room__code-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 26px;
+  letter-spacing: 0.18em;
+  color: var(--accent, #7dd3fc);
+}
+
+.gui-phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  padding: 2px 12px;
+  font-size: 12px;
+}
+
+.gui-phase--waiting {
+  color: var(--pending, #fbbf24);
+}
+
+.gui-phase--ready {
+  color: var(--accent, #7dd3fc);
+}
+
+.gui-phase--playing {
+  color: var(--ok, #34d399);
+}
+
+.gui-phase--paused {
+  color: var(--pending, #fbbf24);
+}
+
+.gui-phase--finished {
+  color: var(--muted, #8ea0bd);
+}
+
+.gui-players {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.gui-player {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border, #1f2b45);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.gui-player--self {
+  border-color: var(--accent, #7dd3fc);
+}
+
+.gui-player__main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.gui-player__seat {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--muted, #8ea0bd);
+}
+
+.gui-player__nickname {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gui-player__tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.gui-tag {
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  border: 1px solid currentColor;
+}
+
+.gui-tag--host {
+  color: var(--accent, #7dd3fc);
+}
+
+.gui-tag--ready {
+  color: var(--ok, #34d399);
+}
+
+.gui-tag--unready {
+  color: var(--muted, #8ea0bd);
+}
+
+.gui-tag--offline {
+  color: var(--danger, #f87171);
+}
+
+.gui-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.gui-button {
+  appearance: none;
+  border-radius: 8px;
+  border: 1px solid var(--border, #1f2b45);
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+.gui-button:hover:not(:disabled) {
+  border-color: var(--accent, #7dd3fc);
+}
+
+.gui-button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.gui-button--primary {
+  border-color: var(--accent, #7dd3fc);
+  color: var(--accent, #7dd3fc);
+}
+
+.gui-button--danger {
+  border-color: var(--danger, #f87171);
+  color: var(--danger, #f87171);
+}
+
+.gui-entry {
+  display: grid;
+  gap: 12px;
+}
+
+.gui-field {
+  display: grid;
+  gap: 4px;
+}
+
+.gui-field > label {
+  font-size: 12px;
+  color: var(--muted, #8ea0bd);
+}
+
+.gui-input {
+  appearance: none;
+  border-radius: 8px;
+  border: 1px solid var(--border, #1f2b45);
+  background: rgba(0, 0, 0, 0.24);
+  color: inherit;
+  font: inherit;
+  padding: 8px 10px;
+}
+
+.gui-input:focus {
+  outline: 1px solid var(--accent, #7dd3fc);
+}
+
+.gui-input--code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.gui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+.gui-badge--connected {
+  color: var(--ok, #34d399);
+}
+
+.gui-badge--connecting,
+.gui-badge--reconnecting {
+  color: var(--pending, #fbbf24);
+}
+
+.gui-badge--idle,
+.gui-badge--closed {
+  color: var(--muted, #8ea0bd);
+}
+
+.gui-error {
+  border: 1px solid var(--danger, #f87171);
+  color: var(--danger, #f87171);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.gui-hint {
+  color: var(--muted, #8ea0bd);
+  font-size: 12px;
+  margin: 0;
+}

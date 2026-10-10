@@ -12,7 +12,10 @@
   },
   "dependencies": {
     "@h5/diffusion-master": "workspace:*",
+    "@h5/game-client": "workspace:*",
+    "@h5/game-core": "workspace:*",
     "@h5/game-protocol": "workspace:*",
+    "@h5/game-ui": "workspace:*",
     "phaser": "3.90.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"

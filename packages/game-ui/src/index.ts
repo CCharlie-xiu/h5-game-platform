@@ -1,14 +1,24 @@
 /**
  * @h5/game-ui —— 通用游戏 UI
  *
- * 阶段 1 仅建立包入口，**未实现任何组件**。
+ * 阶段 2 提供房间相关的通用组件：
+ * - `RoomEntry`       创建 / 加入房间
+ * - `RoomView`        房间视图（房间码、玩家列表、生命周期操作）
+ * - `PlayerList`      玩家列表
+ * - `ConnectionBadge` 连接状态
  *
- * 后续阶段计划：
- * - 大厅（Lobby）：游戏列表与开局入口
- * - 房间（Room）：玩家列表、准备状态、开始按钮
- * - 结算（Result）：名次、得分、再来一局
- *
- * 该包后续将以 React 作为 peer 依赖，并复用 `@h5/game-core` 的生命周期类型。
+ * 组件为纯展示 + 回调，不持有业务状态；状态由 `@h5/game-client` 提供。
+ * 样式通过 `@h5/game-ui/styles.css` 引入。
  */
 
-export {};
+export { ConnectionBadge } from './components/ConnectionBadge';
+export type { ConnectionBadgeProps } from './components/ConnectionBadge';
+
+export { PlayerList } from './components/PlayerList';
+export type { PlayerListProps } from './components/PlayerList';
+
+export { RoomEntry } from './components/RoomEntry';
+export type { RoomEntryProps } from './components/RoomEntry';
+
+export { RoomView } from './components/RoomView';
+export type { RoomViewProps } from './components/RoomView';

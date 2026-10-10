@@ -1,11 +1,10 @@
-import {
-  implemented as diffusionMasterImplemented,
-  manifest as diffusionMaster,
-} from '@h5/diffusion-master';
+import { implemented as diffusionMasterImplemented, manifest as diffusionMaster } from '@h5/diffusion-master';
+import { RoomEntry, RoomView } from '@h5/game-ui';
 import { useEffect, useState } from 'react';
 import { version as reactVersion } from 'react';
 
 import { GameCanvas } from './components/GameCanvas';
+import { identityStore, useRoomClient } from './hooks/useRoomClient';
 import { fetchHealth } from './lib/api';
 import type { HealthResult } from './lib/api';
 import { getRuntimeInfo } from './lib/runtime';
@@ -14,10 +13,13 @@ type HealthState =
   | { readonly phase: 'loading' }
   | { readonly phase: 'settled'; readonly result: HealthResult };
 
-/** 阶段 1 首页：展示项目状态、游戏入口、运行环境与 Worker 健康检查。 */
+/** 阶段 2 首页：通用房间系统（创建 / 加入 / 准备 / 开始 / 暂停 / 继续 / 结束）。 */
 export function App() {
   const runtime = getRuntimeInfo();
+  const { client, snapshot } = useRoomClient();
   const [health, setHealth] = useState<HealthState>({ phase: 'loading' });
+  const [storedIdentity] = useState(() => identityStore.load());
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -29,36 +31,113 @@ export function App() {
     };
   }, []);
 
+  const handleCreate = (params: { gameId: string; nickname: string }) => {
+    setBusy(true);
+    void client
+      .createRoom(params)
+      .catch(() => {
+        /* 错误已写入 snapshot.lastError */
+      })
+      .finally(() => setBusy(false));
+  };
+
+  const handleJoin = (params: { roomCode: string; nickname: string }) => {
+    client.joinRoom(params);
+  };
+
+  const handleResume = () => {
+    if (!storedIdentity) {
+      return;
+    }
+    client.joinRoom({
+      roomCode: storedIdentity.roomCode,
+      nickname: storedIdentity.nickname ?? '玩家',
+    });
+  };
+
   return (
     <div className="page">
       <header className="hero">
         <p className="hero__eyebrow">pnpm workspace · monorepo</p>
         <h1 className="hero__title">H5 Game Platform</h1>
         <p className="hero__subtitle">
-          可复用的 H5 联机游戏平台。当前处于 <strong>阶段 1：工程初始化</strong>
-          ，只完成工程骨架与运行验证；游戏规则、动画与房间系统尚未实现。
+          可复用的 H5 联机游戏平台。当前处于 <strong>阶段 2：通用房间系统与游戏生命周期</strong>
+          ，房间创建、加入、准备、开始、暂停、继续、结束已可用；
+          <strong>扩散大师的具体游戏规则与动画尚未实现</strong>。
         </p>
       </header>
 
       <main className="grid">
+        <section className="card card--wide" data-testid="room-card">
+          <h2 className="card__title">房间</h2>
+
+          {snapshot.lastError ? (
+            <p className="gui-error" data-testid="room-error">
+              [{snapshot.lastError.code}] {snapshot.lastError.message}
+            </p>
+          ) : null}
+
+          {snapshot.room ? (
+            <RoomView
+              room={snapshot.room}
+              status={snapshot.status}
+              reconnectAttempts={snapshot.reconnectAttempts}
+              selfPlayerId={snapshot.identity?.playerId ?? null}
+              onToggleReady={(ready) => {
+                if (ready) {
+                  client.setReady();
+                } else {
+                  client.setUnready();
+                }
+              }}
+              onStart={() => client.startGame()}
+              onPause={() => client.pauseGame()}
+              onResume={() => client.resumeGame()}
+              onEnd={() => client.endGame()}
+              onLeave={() => client.leaveRoom()}
+            />
+          ) : (
+            <>
+              <RoomEntry
+                gameId={diffusionMaster.id}
+                disabled={busy || snapshot.status === 'connecting'}
+                onCreate={handleCreate}
+                onJoin={handleJoin}
+              />
+              {storedIdentity ? (
+                <div className="gui-actions" style={{ marginTop: 12 }}>
+                  <button
+                    type="button"
+                    data-testid="btn-resume-room"
+                    className="gui-button"
+                    onClick={handleResume}
+                  >
+                    恢复上次房间（{storedIdentity.roomCode}）
+                  </button>
+                </div>
+              ) : null}
+            </>
+          )}
+        </section>
+
         <section className="card">
           <h2 className="card__title">项目状态</h2>
           <dl className="kv">
             <div>
               <dt>阶段</dt>
-              <dd>阶段 1 · 工程初始化</dd>
+              <dd>阶段 2 · 通用房间系统</dd>
             </div>
             <div>
               <dt>前端</dt>
               <dd>React + TypeScript + Vite</dd>
             </div>
             <div>
-              <dt>渲染</dt>
-              <dd>Phaser（已接入，仅占位舞台）</dd>
+              <dt>实时房间</dt>
+              <dd>Durable Object + WebSocket（已实现）</dd>
             </div>
             <div>
-              <dt>后端</dt>
-              <dd>Cloudflare Workers（本地开发）</dd>
+              <dt>持久化</dt>
+              <dd>DO storage（实时）+ D1（生命周期记录）</dd>
             </div>
           </dl>
         </section>
@@ -79,11 +158,11 @@ export function App() {
                   diffusionMasterImplemented ? 'badge badge--ok' : 'badge badge--pending'
                 }
               >
-                {diffusionMasterImplemented ? '可玩' : '尚未实现'}
+                {diffusionMasterImplemented ? '可玩' : '规则未实现'}
               </span>
             </li>
           </ul>
-          <p className="card__note">游戏规则、房间匹配与玩家同步属于后续阶段。</p>
+          <p className="card__note">房间系统已可用；游戏规则、动画与结算属于后续阶段。</p>
         </section>
 
         <section className="card">
@@ -92,12 +171,6 @@ export function App() {
             <div>
               <dt>模式</dt>
               <dd>{runtime.mode}</dd>
-            </div>
-            <div>
-              <dt>DEV / PROD</dt>
-              <dd>
-                {String(runtime.dev)} / {String(runtime.prod)}
-              </dd>
             </div>
             <div>
               <dt>Vite</dt>
@@ -166,7 +239,7 @@ export function App() {
       </main>
 
       <footer className="footer">
-        <span>阶段 1 仅用于工程验证，不代表最终功能形态。</span>
+        <span>阶段 2 以功能验证为主，未做复杂视觉设计。</span>
       </footer>
     </div>
   );
