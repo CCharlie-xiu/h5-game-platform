@@ -1,5 +1,5 @@
 import { generateRandomBytes, generateRoomCode, isValidRoomCode } from '@h5/game-core';
-import { ErrorCode } from '@h5/game-protocol';
+import { ErrorCode, createRoomPayloadSchema } from '@h5/game-protocol';
 
 import { GameRoom } from './durable-objects/game-room';
 import type { Env } from './env';
@@ -39,6 +39,9 @@ function fail(code: string, message: string, status: number): Response {
  *
  * 房间码由服务端生成，通过 Durable Object 的原子创建保证不冲突：
  * DO 已存在则返回 409，这里换码重试。
+ *
+ * 入参复用 `@h5/game-protocol` 的共享 Zod Schema（与 WebSocket `CREATE_ROOM` 同一套规则），
+ * 非法输入在服务端入口即被拒绝，不会产生服务端自己都无法解析的房间快照。
  */
 async function createRoom(request: Request, env: Env): Promise<Response> {
   let body: unknown;
@@ -49,12 +52,27 @@ async function createRoom(request: Request, env: Env): Promise<Response> {
   }
 
   const input = (body ?? {}) as Record<string, unknown>;
-  const gameId = typeof input.gameId === 'string' && input.gameId ? input.gameId : DEFAULT_GAME_ID;
-  const nickname = typeof input.nickname === 'string' && input.nickname ? input.nickname : '';
-  if (!nickname) {
-    return fail(ErrorCode.InvalidMessage, 'nickname 必填', 400);
+  const parsed = createRoomPayloadSchema.safeParse({
+    gameId: input.gameId ?? DEFAULT_GAME_ID,
+    nickname: input.nickname,
+    ...(input.maxPlayers === undefined ? {} : { maxPlayers: input.maxPlayers }),
+  });
+
+  if (!parsed.success) {
+    return json(
+      {
+        error: ErrorCode.InvalidMessage,
+        message: '创建房间参数不合法',
+        details: parsed.error.issues.map((issue) => ({
+          path: issue.path.join('.'),
+          message: issue.message,
+        })),
+      },
+      400,
+    );
   }
-  const maxPlayers = typeof input.maxPlayers === 'number' ? input.maxPlayers : undefined;
+
+  const { gameId, nickname, maxPlayers } = parsed.data;
 
   for (let attempt = 0; attempt < ROOM_CODE_ATTEMPTS; attempt += 1) {
     const roomCode = generateRoomCode(generateRandomBytes(8));

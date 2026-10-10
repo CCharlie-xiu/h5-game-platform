@@ -1,6 +1,6 @@
 import { PROTOCOL_VERSION, createMessageId } from '@h5/game-protocol';
 import type { ServerMessage } from '@h5/game-protocol';
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { expect } from 'vitest';
 
 const BASE = 'https://example.com';
@@ -38,6 +38,46 @@ export async function fetchSnapshot(roomCode: string): Promise<{ status: number;
   return { status: response.status, body: await response.json() };
 }
 
+/** 读取房间当前 revision（用于断言「被拒绝的操作没有改动状态」）。 */
+export async function revisionOf(roomCode: string): Promise<number> {
+  const snapshot = await fetchSnapshot(roomCode);
+  const body = snapshot.body as { room: { revision: number } };
+  return body.room.revision;
+}
+
+/** 以原始请求体调用 POST /api/rooms（用于校验非法入参被入口拒绝）。 */
+export async function postCreateRoom(
+  body: unknown,
+): Promise<{ status: number; body: unknown }> {
+  const response = await SELF.fetch(`${BASE}/api/rooms`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json().catch(() => null) };
+}
+
+/** 取得房间对应的 Durable Object stub（用于 alarm / 逐出 / 直接调用实例方法）。 */
+export function roomStub(roomCode: string): DurableObjectStub {
+  const bindings = env as unknown as { GAME_ROOM: DurableObjectNamespace };
+  return bindings.GAME_ROOM.get(bindings.GAME_ROOM.idFromName(roomCode));
+}
+
+/** 轮询直到房间被销毁（`GET /api/rooms/:code` 返回 404）。 */
+export async function waitForRoomGone(roomCode: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const snapshot = await fetchSnapshot(roomCode);
+    if (snapshot.status === 404) {
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`等待房间 ${roomCode} 销毁超时（当前状态 ${snapshot.status}）`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 /** WebSocket 测试封装：按消息类型等待，未消费的消息进入队列。 */
 export class RoomSocket {
   private readonly socket: WebSocket;
@@ -47,11 +87,47 @@ export class RoomSocket {
     resolve: (message: ServerMessage) => void;
     timer: ReturnType<typeof setTimeout>;
   }> = [];
+  private closed = false;
+  private closeWaiters: Array<() => void> = [];
 
   constructor(socket: WebSocket) {
     this.socket = socket;
     socket.addEventListener('message', (event: MessageEvent) => {
       this.push(JSON.parse(String(event.data)) as ServerMessage);
+    });
+    socket.addEventListener('close', () => {
+      this.closed = true;
+      const waiters = this.closeWaiters;
+      this.closeWaiters = [];
+      for (const waiter of waiters) {
+        waiter();
+      }
+    });
+  }
+
+  /** 客户端侧是否已观察到连接关闭。 */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** 等待连接被关闭（例如被服务端作为「旧连接」替换时）。 */
+  waitForClose(timeoutMs = 4000): Promise<void> {
+    if (this.closed) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const onClose = () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+        }
+        resolve();
+      };
+      timer = setTimeout(() => {
+        this.closeWaiters = this.closeWaiters.filter((waiter) => waiter !== onClose);
+        reject(new Error('等待连接关闭超时'));
+      }, timeoutMs);
+      this.closeWaiters.push(onClose);
     });
   }
 
@@ -106,10 +182,22 @@ export class RoomSocket {
     }
   }
 
-  /** 发送一条协议消息，返回 messageId。 */
-  send(type: string, payload: unknown, messageId = createMessageId()): string {
+  /** 发送一条协议消息，返回 messageId。可显式指定封套中的 roomId / sessionId。 */
+  send(
+    type: string,
+    payload: unknown,
+    messageId = createMessageId(),
+    envelope: { roomId?: string; sessionId?: string } = {},
+  ): string {
     this.socket.send(
-      JSON.stringify({ protocolVersion: PROTOCOL_VERSION, messageId, type, payload }),
+      JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        messageId,
+        type,
+        ...(envelope.roomId === undefined ? {} : { roomId: envelope.roomId }),
+        ...(envelope.sessionId === undefined ? {} : { sessionId: envelope.sessionId }),
+        payload,
+      }),
     );
     return messageId;
   }

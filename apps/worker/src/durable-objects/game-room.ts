@@ -4,6 +4,7 @@ import {
   createServerMessage,
   parseClientMessage,
   protocolError,
+  roomSnapshotSchema,
   serializeMessage,
 } from '@h5/game-protocol';
 import type {
@@ -15,14 +16,16 @@ import type {
 } from '@h5/game-protocol';
 import {
   LifecycleTrigger,
-  ROOM_LIMITS,
   applyTrigger,
   attachConnection,
+  checkEnvelopeScope,
   createRoom,
   detachConnection,
+  evaluateRoomCleanup,
   findPlayer,
   generateId,
   generateSecret,
+  isEmpty,
   isValidRoomCode,
   join,
   leave,
@@ -32,7 +35,7 @@ import {
   toSnapshot,
   verifyToken,
 } from '@h5/game-core';
-import type { RoomRecord } from '@h5/game-core';
+import type { PlayerRecord, RoomRecord } from '@h5/game-core';
 
 import { createRoomRepository } from '../db/repository';
 import type { RoomRepository } from '../db/repository';
@@ -48,12 +51,6 @@ const ROOM_STORAGE_KEY = 'room';
 /** 清理检查间隔。 */
 const CLEANUP_INTERVAL_MS = 60_000;
 
-/** 无在线玩家后，多久销毁房间。 */
-const EMPTY_ROOM_TTL_MS = 60_000;
-
-/** 完全无活动后，多久销毁房间。 */
-const IDLE_ROOM_TTL_MS = 30 * 60_000;
-
 /** 去重窗口大小。 */
 const MAX_SEEN_MESSAGES = 200;
 
@@ -66,6 +63,11 @@ interface SocketAttachment {
   readonly playerId: string | null;
   readonly connectedAt: number;
 }
+
+/** 玩家操作授权结果。 */
+type AuthorizationResult =
+  | { readonly ok: true; readonly playerId: string; readonly player: PlayerRecord }
+  | { readonly ok: false; readonly error: ProtocolError };
 
 /* -------------------------------------------------------------------------- */
 /* Durable Object                                                              */
@@ -155,16 +157,26 @@ export class GameRoom implements DurableObject {
       roomCode,
       gameId,
       hostPlayerId,
-      hostNickname: nickname.slice(0, ROOM_LIMITS.nicknameMaxLength),
+      hostNickname: nickname,
       authSecret,
       maxPlayers,
       now,
     });
 
+    // 防御：确保不会持久化 / 广播「服务端自己都无法解析」的快照
+    const snapshot = toSnapshot(room);
+    const validated = roomSnapshotSchema.safeParse(snapshot);
+    if (!validated.success) {
+      console.error('[GameRoom] 创建房间产生非法快照', validated.error.issues);
+      return Response.json(
+        { error: ErrorCode.InvalidMessage, message: '房间参数不合法' },
+        { status: 400 },
+      );
+    }
+
     await this.persist(room);
     await this.scheduleCleanup();
 
-    const snapshot = toSnapshot(room);
     this.state.waitUntil(this.safe(() => this.recordRoomCreated(room, snapshot)));
 
     const token = await signToken(authSecret, roomCode, hostPlayerId);
@@ -243,32 +255,23 @@ export class GameRoom implements DurableObject {
     await this.handleDisconnect(ws, 'DISCONNECTED');
   }
 
-  /** 房间清理：无在线玩家或长时间无活动时销毁。 */
+  /**
+   * 房间清理。
+   *
+   * 清理策略见 `evaluateRoomCleanup`：**只要还有在线玩家就永不销毁**
+   * （长时间无状态变更不构成清理依据）；仅剩离线玩家时保留座位直到重连宽限期结束。
+   */
   async alarm(): Promise<void> {
     const room = await this.requireRoom();
     if (!room) {
-      await this.state.storage.deleteAll();
-      this.cached = null;
+      await this.destroyRoom();
       return;
     }
 
-    const now = Date.now();
-    const online = room.players.filter((player) => player.online).length;
-    const idleFor = now - room.lastActivityAt;
-
-    const shouldDestroy =
-      (online === 0 && idleFor >= EMPTY_ROOM_TTL_MS) || idleFor >= IDLE_ROOM_TTL_MS;
-
-    if (shouldDestroy) {
-      for (const socket of this.state.getWebSockets()) {
-        try {
-          socket.close(1000, 'room closed');
-        } catch {
-          // 忽略已关闭的连接
-        }
-      }
-      await this.state.storage.deleteAll();
-      this.cached = null;
+    const decision = evaluateRoomCleanup(room, Date.now());
+    if (decision.destroy) {
+      console.log(`[GameRoom] 销毁房间 ${room.roomCode}（原因：${decision.reason}）`);
+      await this.destroyRoom();
       return;
     }
 
@@ -278,10 +281,26 @@ export class GameRoom implements DurableObject {
   /* -------------------------------- 分发 --------------------------------- */
 
   private async dispatch(ws: WebSocket, message: ClientMessage): Promise<void> {
+    // CREATE_ROOM 在房间建立之前执行，不做房间范围校验
+    if (message.type === ClientMessageType.CreateRoom) {
+      await this.onCreateRoom(ws, message);
+      return;
+    }
+
+    const room = await this.requireRoom();
+    if (!room) {
+      this.sendError(ws, protocolError(ErrorCode.RoomNotFound, '房间不存在或已过期'));
+      return;
+    }
+
+    // 封套中的 roomId / sessionId 必须与当前房间、当前对局一致；缺省按协议定义允许省略
+    const scopeError = checkEnvelopeScope(message, room);
+    if (scopeError) {
+      this.sendError(ws, scopeError);
+      return;
+    }
+
     switch (message.type) {
-      case ClientMessageType.CreateRoom:
-        await this.onCreateRoom(ws, message);
-        return;
       case ClientMessageType.JoinRoom:
         await this.onJoinRoom(ws, message);
         return;
@@ -340,7 +359,7 @@ export class GameRoom implements DurableObject {
       roomCode,
       gameId,
       hostPlayerId,
-      hostNickname: nickname.slice(0, ROOM_LIMITS.nicknameMaxLength),
+      hostNickname: nickname,
       authSecret,
       maxPlayers,
       now,
@@ -378,6 +397,18 @@ export class GameRoom implements DurableObject {
       return;
     }
 
+    // 房间码仅用于定位房间（不是身份凭证），但必须与当前房间实例严格一致
+    if (message.payload.roomCode !== room.roomCode) {
+      this.sendError(
+        ws,
+        protocolError(ErrorCode.RoomNotFound, '房间码与当前房间不一致', {
+          received: message.payload.roomCode,
+          expected: room.roomCode,
+        }),
+      );
+      return;
+    }
+
     const { nickname, playerId: claimedPlayerId, token } = message.payload;
     const roomCode = room.roomCode;
     const now = Date.now();
@@ -389,23 +420,33 @@ export class GameRoom implements DurableObject {
         this.sendError(ws, protocolError(ErrorCode.Unauthorized, '身份令牌无效'));
         return;
       }
-      const existing = findPlayer(room, claimedPlayerId);
+
+      // 令牌校验是异步过程，期间房间可能已被其他玩家修改。
+      // 必须基于校验完成后的**最新状态**计算，否则会用过期快照覆盖并发变更。
+      const latest = await this.requireRoom();
+      if (!latest || latest.roomCode !== roomCode) {
+        this.sendError(ws, protocolError(ErrorCode.RoomNotFound, '房间不存在或已过期'));
+        return;
+      }
+
+      const existing = findPlayer(latest, claimedPlayerId);
       if (!existing) {
         this.sendError(ws, protocolError(ErrorCode.RoomNotFound, '玩家不存在，无法恢复'));
         return;
       }
 
-      this.closeOtherSockets(claimedPlayerId, attachment.connectionId);
-
-      const attached = attachConnection(room, claimedPlayerId, attachment.connectionId, now);
+      const attached = attachConnection(latest, claimedPlayerId, attachment.connectionId, now);
       if (!attached.ok) {
         this.sendError(ws, attached.error);
         return;
       }
 
+      // 先落库并同步更新内存缓存（`persist` 在首个 await 之前完成赋值），
+      // 使服务端连接绑定立即指向新连接；随后才关闭旧连接。
+      // 这样即使旧连接仍处于关闭握手窗口内，也会因绑定不匹配而被授权校验拒绝。
       await this.persist(attached.room);
-      await this.scheduleCleanup();
       ws.serializeAttachment({ ...attachment, playerId: claimedPlayerId });
+      this.closeOtherSockets(claimedPlayerId, attachment.connectionId);
 
       this.send(
         ws,
@@ -428,7 +469,8 @@ export class GameRoom implements DurableObject {
         ),
         attachment.connectionId,
       );
-      this.broadcastState(attached.room);
+      await this.broadcastLatestState();
+      await this.scheduleCleanup();
       return;
     }
 
@@ -436,7 +478,7 @@ export class GameRoom implements DurableObject {
     const newPlayerId = generateId('p_');
     const result = join(room, {
       playerId: newPlayerId,
-      nickname: nickname.slice(0, ROOM_LIMITS.nicknameMaxLength),
+      nickname,
       connectionId: attachment.connectionId,
       now,
     });
@@ -446,7 +488,6 @@ export class GameRoom implements DurableObject {
     }
 
     await this.persist(result.room);
-    await this.scheduleCleanup();
     ws.serializeAttachment({ ...attachment, playerId: newPlayerId });
 
     const newToken = await signToken(result.room.authSecret, roomCode, newPlayerId);
@@ -469,10 +510,14 @@ export class GameRoom implements DurableObject {
         this.safe(() => this.repository.recordPlayerJoined(roomCode, playerSnapshot)),
       );
     }
-    this.broadcastState(result.room);
-    this.state.waitUntil(
-      this.safe(() => this.repository.recordRoomStatus(toSnapshot(result.room))),
-    );
+
+    const latest = await this.broadcastLatestState();
+    if (latest) {
+      this.state.waitUntil(
+        this.safe(() => this.repository.recordRoomStatus(toSnapshot(latest))),
+      );
+    }
+    await this.scheduleCleanup();
   }
 
   private async onLeaveRoom(ws: WebSocket): Promise<void> {
@@ -483,39 +528,51 @@ export class GameRoom implements DurableObject {
     }
 
     const attachment = this.attachmentOf(ws);
-    if (!attachment.playerId) {
-      this.sendError(ws, protocolError(ErrorCode.NotInRoom, '当前连接尚未加入房间'));
+    const auth = this.authorizePlayer(room, attachment);
+    if (!auth.ok) {
+      this.sendError(ws, auth.error);
       return;
     }
 
-    const player = findPlayer(room, attachment.playerId);
-    const result = leave(room, attachment.playerId, Date.now());
+    const result = leave(room, auth.playerId, Date.now());
     if (!result.ok) {
       this.sendError(ws, result.error);
       return;
     }
 
     await this.persist(result.room);
-    await this.scheduleCleanup();
     ws.serializeAttachment({ ...attachment, playerId: null });
 
-    if (player) {
-      this.broadcast(
-        createServerMessage(
-          'PLAYER_LEFT',
-          { playerId: player.playerId, nickname: player.nickname, reason: 'LEFT' },
-          { roomId: room.roomCode },
-        ),
-        attachment.connectionId,
-      );
+    this.broadcast(
+      createServerMessage(
+        'PLAYER_LEFT',
+        { playerId: auth.player.playerId, nickname: auth.player.nickname, reason: 'LEFT' },
+        { roomId: room.roomCode },
+      ),
+      attachment.connectionId,
+    );
+    this.state.waitUntil(
+      this.safe(() =>
+        this.repository.recordPlayerLeft(room.roomCode, auth.player.playerId, Date.now()),
+      ),
+    );
+
+    // 房间已无玩家：立即销毁，避免遗留悬空房主身份与「永远无法开局」的空房间
+    if (isEmpty(result.room)) {
       this.state.waitUntil(
-        this.safe(() => this.repository.recordPlayerLeft(room.roomCode, player.playerId, Date.now())),
+        this.safe(() => this.repository.recordRoomStatus(toSnapshot(result.room))),
+      );
+      await this.destroyRoom();
+      return;
+    }
+
+    const latest = await this.broadcastLatestState();
+    if (latest) {
+      this.state.waitUntil(
+        this.safe(() => this.repository.recordRoomStatus(toSnapshot(latest))),
       );
     }
-    this.broadcastState(result.room);
-    this.state.waitUntil(
-      this.safe(() => this.repository.recordRoomStatus(toSnapshot(result.room))),
-    );
+    await this.scheduleCleanup();
   }
 
   private async onSetReady(ws: WebSocket, ready: boolean): Promise<void> {
@@ -525,21 +582,21 @@ export class GameRoom implements DurableObject {
       return;
     }
 
-    const attachment = this.attachmentOf(ws);
-    if (!attachment.playerId) {
-      this.sendError(ws, protocolError(ErrorCode.NotInRoom, '当前连接尚未加入房间'));
+    const auth = this.authorizePlayer(room, this.attachmentOf(ws));
+    if (!auth.ok) {
+      this.sendError(ws, auth.error);
       return;
     }
 
-    const result = setReady(room, attachment.playerId, ready, Date.now());
+    const result = setReady(room, auth.playerId, ready, Date.now());
     if (!result.ok) {
       this.sendError(ws, result.error);
       return;
     }
 
     await this.persist(result.room);
+    await this.broadcastLatestState();
     await this.scheduleCleanup();
-    this.broadcastState(result.room);
   }
 
   private async onTrigger(ws: WebSocket, trigger: LifecycleTrigger): Promise<void> {
@@ -549,22 +606,20 @@ export class GameRoom implements DurableObject {
       return;
     }
 
-    const attachment = this.attachmentOf(ws);
-    if (!attachment.playerId) {
-      this.sendError(ws, protocolError(ErrorCode.NotInRoom, '当前连接尚未加入房间'));
+    const auth = this.authorizePlayer(room, this.attachmentOf(ws));
+    if (!auth.ok) {
+      this.sendError(ws, auth.error);
       return;
     }
 
     const previousSessionId = room.sessionId;
-    const result = applyTrigger(room, trigger, attachment.playerId, Date.now());
+    const result = applyTrigger(room, trigger, auth.playerId, Date.now());
     if (!result.ok) {
       this.sendError(ws, result.error);
       return;
     }
 
     await this.persist(result.room);
-    await this.scheduleCleanup();
-    this.broadcastState(result.room);
 
     const now = Date.now();
     const nextSessionId = result.room.sessionId;
@@ -581,9 +636,14 @@ export class GameRoom implements DurableObject {
         this.safe(() => this.repository.recordSessionEnded(previousSessionId, now)),
       );
     }
-    this.state.waitUntil(
-      this.safe(() => this.repository.recordRoomStatus(toSnapshot(result.room))),
-    );
+
+    const latest = await this.broadcastLatestState();
+    if (latest) {
+      this.state.waitUntil(
+        this.safe(() => this.repository.recordRoomStatus(toSnapshot(latest))),
+      );
+    }
+    await this.scheduleCleanup();
   }
 
   private async handleDisconnect(ws: WebSocket, reason: LeaveReason): Promise<void> {
@@ -612,7 +672,6 @@ export class GameRoom implements DurableObject {
     }
 
     await this.persist(result.room);
-    await this.scheduleCleanup();
 
     this.broadcast(
       createServerMessage(
@@ -621,7 +680,8 @@ export class GameRoom implements DurableObject {
         { roomId: room.roomCode },
       ),
     );
-    this.broadcastState(result.room);
+    await this.broadcastLatestState();
+    await this.scheduleCleanup();
   }
 
   /* -------------------------------- 工具 --------------------------------- */
@@ -677,6 +737,70 @@ export class GameRoom implements DurableObject {
       return raw;
     }
     return { connectionId: 'unknown', playerId: null, connectedAt: 0 };
+  }
+
+  /**
+   * 校验发起操作的连接是否为该玩家**当前绑定**的连接。
+   *
+   * 被替换的旧连接即使仍处于关闭握手窗口内，也会在此被拒绝，
+   * 且不会改动房间 revision、准备状态或生命周期阶段。
+   */
+  private authorizePlayer(room: RoomRecord, attachment: SocketAttachment): AuthorizationResult {
+    if (!attachment.playerId) {
+      return { ok: false, error: protocolError(ErrorCode.NotInRoom, '当前连接尚未加入房间') };
+    }
+
+    const player = findPlayer(room, attachment.playerId);
+    if (!player) {
+      return {
+        ok: false,
+        error: protocolError(ErrorCode.NotInRoom, '玩家不在房间内', {
+          playerId: attachment.playerId,
+        }),
+      };
+    }
+
+    if (player.connectionId !== attachment.connectionId) {
+      return {
+        ok: false,
+        error: protocolError(ErrorCode.Unauthorized, '当前连接已被新的连接替换，操作被拒绝', {
+          playerId: attachment.playerId,
+        }),
+      };
+    }
+
+    return { ok: true, playerId: attachment.playerId, player };
+  }
+
+  /**
+   * 广播**当前最新**房间状态。
+   *
+   * 处理器中存在 `await`，若直接广播处理过程中捕获的旧快照，
+   * 迟到的过期广播会让客户端状态回退。这里统一重新读取最新状态。
+   */
+  private async broadcastLatestState(): Promise<RoomRecord | null> {
+    const latest = await this.requireRoom();
+    if (latest) {
+      this.broadcastState(latest);
+    }
+    return latest;
+  }
+
+  /**
+   * 销毁房间：关闭全部连接、清空存储与内存缓存。
+   *
+   * 调用方负责在此之前完成必要的 D1 记录写入（D1 写入不依赖 DO 存储）。
+   */
+  private async destroyRoom(): Promise<void> {
+    for (const socket of this.state.getWebSockets()) {
+      try {
+        socket.close(1000, 'room closed');
+      } catch {
+        // 忽略已关闭的连接
+      }
+    }
+    await this.state.storage.deleteAll();
+    this.cached = null;
   }
 
   private remember(messageId: string): boolean {

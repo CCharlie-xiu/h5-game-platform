@@ -9,7 +9,7 @@ import type {
 import { LifecycleTrigger, evaluateReadyPhase, isTerminal, transition } from './lifecycle';
 import type { TransitionContext } from './lifecycle';
 
-/** 房间容量与昵称约束。 */
+/** 房间容量与昵称约束（与 `@h5/game-protocol` 的 snapshot Schema 保持一致）。 */
 export const ROOM_LIMITS = {
   /** 最少开局人数下限 */
   minPlayers: 2,
@@ -19,7 +19,38 @@ export const ROOM_LIMITS = {
   defaultMaxPlayers: 4,
   /** 昵称最大长度 */
   nicknameMaxLength: 24,
+  /** 游戏标识最大长度 */
+  gameIdMaxLength: 64,
+  /** 房间标识 / 房间码最大长度 */
+  roomIdMaxLength: 16,
 } as const;
+
+/** 把任意输入钳制为合法人数：整数、落在 `[minPlayers, maxPlayers]` 内。 */
+function clampPlayerCount(value: number): number {
+  if (Number.isNaN(value)) {
+    return ROOM_LIMITS.minPlayers;
+  }
+  const integer = Math.trunc(value);
+  return Math.min(Math.max(integer, ROOM_LIMITS.minPlayers), ROOM_LIMITS.maxPlayers);
+}
+
+/**
+ * 归一化房间人数配置。
+ *
+ * 保证返回值是合法整数、处于支持范围，且恒有 `minPlayers <= maxPlayers`
+ * （即不会产生「最少开局人数大于房间容量」的不可开局房间）。
+ */
+export function normalizeRoomLimits(params: {
+  readonly minPlayers?: number | undefined;
+  readonly maxPlayers?: number | undefined;
+}): { readonly minPlayers: number; readonly maxPlayers: number } {
+  const minPlayers = clampPlayerCount(params.minPlayers ?? ROOM_LIMITS.minPlayers);
+  const requestedMax = clampPlayerCount(params.maxPlayers ?? ROOM_LIMITS.defaultMaxPlayers);
+  return {
+    minPlayers,
+    maxPlayers: Math.max(requestedMax, minPlayers),
+  };
+}
 
 /** 房间内的玩家记录（服务端内部模型）。 */
 export interface PlayerRecord {
@@ -156,6 +187,88 @@ export function toSnapshot(room: RoomRecord): RoomSnapshot {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 清理策略                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** 清理策略常量。 */
+export const ROOM_CLEANUP = {
+  /** 房间已无任何玩家时的保留时长 */
+  emptyRoomTtlMs: 60_000,
+  /** 全部玩家离线（座位保留待重连）时的保留时长 */
+  reconnectGraceMs: 5 * 60_000,
+} as const;
+
+/** 房间清理原因。 */
+export type RoomCleanupReason = 'EMPTY' | 'ABANDONED';
+
+/**
+ * 判断房间是否应当被清理（纯函数，便于单测与测试时钟驱动）。
+ *
+ * 规则：
+ * - **只要有在线玩家，永不清理**（长时间无状态变更不是清理依据）
+ * - 无玩家（全部显式离开）→ 超过 `emptyRoomTtlMs` 后清理
+ * - 仅剩离线玩家（座位保留待重连）→ 超过 `reconnectGraceMs` 后清理
+ */
+export function evaluateRoomCleanup(
+  room: RoomRecord,
+  now: number,
+): { readonly destroy: boolean; readonly reason: RoomCleanupReason | null } {
+  if (onlineCount(room) > 0) {
+    return { destroy: false, reason: null };
+  }
+
+  const idleFor = now - room.lastActivityAt;
+
+  if (room.players.length === 0) {
+    return idleFor >= ROOM_CLEANUP.emptyRoomTtlMs
+      ? { destroy: true, reason: 'EMPTY' }
+      : { destroy: false, reason: null };
+  }
+
+  return idleFor >= ROOM_CLEANUP.reconnectGraceMs
+    ? { destroy: true, reason: 'ABANDONED' }
+    : { destroy: false, reason: null };
+}
+
+/* -------------------------------------------------------------------------- */
+/* 消息范围校验                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 校验消息封套中的 `roomId` / `sessionId` 是否与当前房间、当前对局一致。
+ *
+ * - 字段缺省视为「按消息协议定义允许省略」，不做跨局推断
+ * - 字段存在时必须严格匹配，不匹配返回明确错误（不静默接受）
+ */
+export function checkEnvelopeScope(
+  message: { readonly roomId?: string | undefined; readonly sessionId?: string | undefined },
+  room: RoomRecord,
+): ProtocolError | null {
+  if (message.roomId !== undefined && message.roomId !== room.roomCode) {
+    return protocolError(ErrorCode.RoomNotFound, '消息中的 roomId 与当前房间不一致', {
+      received: message.roomId,
+      expected: room.roomCode,
+    });
+  }
+
+  if (message.sessionId !== undefined) {
+    if (room.sessionId === null) {
+      return protocolError(ErrorCode.SessionMismatch, '当前房间没有进行中的对局', {
+        received: message.sessionId,
+      });
+    }
+    if (message.sessionId !== room.sessionId) {
+      return protocolError(ErrorCode.SessionMismatch, '消息中的 sessionId 与当前对局不一致', {
+        received: message.sessionId,
+        expected: room.sessionId,
+      });
+    }
+  }
+
+  return null;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 内部工具                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -200,6 +313,12 @@ function transitionContext(room: RoomRecord, actorPlayerId: string): TransitionC
 /* 操作                                                                        */
 /* -------------------------------------------------------------------------- */
 
+/** 归一化昵称：去首尾空白、限长；空白昵称回退为「玩家」。 */
+export function normalizeNickname(nickname: string): string {
+  const trimmed = nickname.trim().slice(0, ROOM_LIMITS.nicknameMaxLength);
+  return trimmed.length > 0 ? trimmed : '玩家';
+}
+
 /** 创建房间，房主作为 0 号座位玩家直接入座。 */
 export function createRoom(params: {
   readonly roomId: string;
@@ -212,13 +331,14 @@ export function createRoom(params: {
   readonly maxPlayers?: number;
   readonly now: number;
 }): RoomRecord {
-  const maxPlayers = Math.min(
-    Math.max(params.maxPlayers ?? ROOM_LIMITS.defaultMaxPlayers, ROOM_LIMITS.minPlayers),
-    ROOM_LIMITS.maxPlayers,
-  );
+  const { minPlayers, maxPlayers } = normalizeRoomLimits({
+    minPlayers: params.minPlayers,
+    maxPlayers: params.maxPlayers,
+  });
+
   const host: PlayerRecord = {
     playerId: params.hostPlayerId,
-    nickname: params.hostNickname,
+    nickname: normalizeNickname(params.hostNickname),
     ready: false,
     online: false,
     connectionId: null,
@@ -228,12 +348,12 @@ export function createRoom(params: {
   };
 
   return {
-    roomId: params.roomId,
-    roomCode: params.roomCode,
-    gameId: params.gameId,
+    roomId: params.roomId.slice(0, ROOM_LIMITS.roomIdMaxLength),
+    roomCode: params.roomCode.slice(0, ROOM_LIMITS.roomIdMaxLength),
+    gameId: params.gameId.trim().slice(0, ROOM_LIMITS.gameIdMaxLength),
     phase: GamePhase.WAITING,
     hostPlayerId: params.hostPlayerId,
-    minPlayers: params.minPlayers ?? ROOM_LIMITS.minPlayers,
+    minPlayers,
     maxPlayers,
     sessionId: null,
     revision: 1,
@@ -256,6 +376,7 @@ export function join(
     readonly now: number;
   },
 ): RoomResult {
+  const nickname = normalizeNickname(params.nickname);
   const existing = findPlayer(room, params.playerId);
   if (existing) {
     return {
@@ -267,7 +388,7 @@ export function join(
             player.playerId === params.playerId
               ? {
                   ...player,
-                  nickname: params.nickname,
+                  nickname,
                   online: true,
                   connectionId: params.connectionId,
                   leftAt: null,
@@ -292,7 +413,7 @@ export function join(
 
   const player: PlayerRecord = {
     playerId: params.playerId,
-    nickname: params.nickname,
+    nickname,
     ready: false,
     online: true,
     connectionId: params.connectionId,
@@ -301,11 +422,20 @@ export function join(
     leftAt: null,
   };
 
-  const next = touch(room, { players: [...room.players, player] }, params.now);
+  // 空房间（例如最后一名玩家已显式离开）由首位加入者接管房主，
+  // 避免遗留悬空 hostPlayerId 导致房间永久无法开局。
+  const hostPlayerId = room.players.length === 0 ? params.playerId : room.hostPlayerId;
+
+  const next = touch(room, { players: [...room.players, player], hostPlayerId }, params.now);
   return { ok: true, room: withEvaluatedPhase(next) };
 }
 
-/** 玩家显式离开：移除座位；房主离开时移交房主。 */
+/**
+ * 玩家显式离开：移除座位；房主离开时移交给座位最靠前的剩余玩家。
+ *
+ * 契约：若离开后房间变为空（`isEmpty` 为 true），`hostPlayerId` 会暂时指向已离开的玩家。
+ * 调用方**必须**立即销毁该房间，不要持久化空房间。
+ */
 export function leave(room: RoomRecord, playerId: string, now: number): RoomResult {
   const player = findPlayer(room, playerId);
   if (!player) {
@@ -460,7 +590,13 @@ export function applyTrigger(
   return { ok: true, room: touch(room, patch, now) };
 }
 
-/** 是否应当销毁房间（无玩家）。 */
+/**
+ * 房间是否已无任何玩家。
+ *
+ * 契约：返回 true 时调用方**必须**立即销毁房间（关闭连接 + 清空存储），
+ * 不得把空房间持久化下来，否则会遗留悬空房主身份。
+ * `join()` 对「向空房间加入」做了自愈（首位加入者接管房主）作为兜底。
+ */
 export function isEmpty(room: RoomRecord): boolean {
   return room.players.length === 0;
 }
